@@ -1,25 +1,101 @@
-// server.js
 import express from "express";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
+import crypto from "crypto";
 
 dotenv.config();
 const app = express();
-app.use(express.json());
+app.use(express.json({ type: "application/json" }));
 
-// Shopify
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE; 
-const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN; 
+// Shopify config
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
+const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN;
 const SHOPIFY_API_VERSION = "2025-01";
-const SHOPIFY_LOCATION_ID = process.env.SHOPIFY_LOCATION_ID; 
+const SHOPIFY_LOCATION_ID = process.env.SHOPIFY_LOCATION_ID;
+const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 
+// FinerWorks config
+const FINERWORKS_API_BASE = process.env.FINERWORKS_API_BASE;
+const FINERWORKS_KEY = process.env.FINERWORKS_KEY;
 
-const FINERWORKS_API_BASE = process.env.FINERWORKS_API_BASE; 
-const FINERWORKS_KEY = process.env.FINERWORKS_KEY; 
+// ✅ Verify Shopify Webhook
+function verifyShopifyWebhook(req) {
+  const hmacHeader = req.get("X-Shopify-Hmac-Sha256");
+  const body = JSON.stringify(req.body);
+  const hash = crypto
+    .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
+    .update(body, "utf8")
+    .digest("base64");
+  return hash === hmacHeader;
+}
 
+/**
+ * -------------------------------
+ * PRODUCT SYNC
+ * -------------------------------
+ * Pull products from FinerWorks API
+ * Push them into Shopify (create/update)
+ */
+app.get("/sync-products", async (req, res) => {
+  try {
+    // 1. Get products from FinerWorks
+    const fwRes = await fetch(`${FINERWORKS_API_BASE}/products`, {
+      headers: { Authorization: `Bearer ${FINERWORKS_KEY}` },
+    });
+    const fwProducts = await fwRes.json();
+
+    // 2. Loop through products and push to Shopify
+    for (const fwProduct of fwProducts) {
+      const shopifyProduct = {
+        product: {
+          title: fwProduct.name,
+          body_html: fwProduct.description,
+          vendor: "FinerWorks",
+          variants: fwProduct.variants.map((v) => ({
+            sku: v.sku,
+            price: v.price,
+            option1: v.option1,
+            option2: v.option2,
+            option3: v.option3,
+          })),
+        },
+      };
+
+      const shopifyRes = await fetch(
+        `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/products.json`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+          },
+          body: JSON.stringify(shopifyProduct),
+        }
+      );
+
+      const shopifyData = await shopifyRes.json();
+      console.log(`✅ Synced product ${fwProduct.name}`, shopifyData);
+    }
+
+    res.json({ message: "✅ Products synced from FinerWorks → Shopify" });
+  } catch (err) {
+    console.error("❌ Error syncing products:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * -------------------------------
+ * ORDER SYNC (Shopify → FinerWorks)
+ * -------------------------------
+ */
 app.post("/shopify-order-created", async (req, res) => {
-  const order = req.body;
+  if (!verifyShopifyWebhook(req)) {
+    console.error("❌ Invalid Shopify HMAC");
+    return res.sendStatus(401);
+  }
 
+  const order = req.body;
   console.log("📦 New order from Shopify:", order.id);
 
   try {
@@ -27,16 +103,16 @@ app.post("/shopify-order-created", async (req, res) => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${FINERWORKS_KEY}`
+        Authorization: `Bearer ${FINERWORKS_KEY}`,
       },
       body: JSON.stringify({
         orderNumber: order.id,
         shippingAddress: order.shipping_address,
-        items: order.line_items.map(item => ({
+        items: order.line_items.map((item) => ({
           sku: item.sku,
-          quantity: item.quantity
-        }))
-      })
+          quantity: item.quantity,
+        })),
+      }),
     });
 
     const fwData = await fwResponse.json();
@@ -44,52 +120,61 @@ app.post("/shopify-order-created", async (req, res) => {
 
     res.sendStatus(200);
   } catch (err) {
-    console.error("❌ Error sending to FinerWorks:", err);
+    console.error("❌ Error sending to FinerWorks:", err.message);
     res.sendStatus(500);
   }
 });
 
+/**
+ * -------------------------------
+ * TRACKING SYNC (FinerWorks → Shopify)
+ * -------------------------------
+ */
 app.post("/finerworks-update", async (req, res) => {
   const update = req.body;
   console.log("🔄 Update from FinerWorks:", update);
 
-  const shopifyOrderId = update.orderNumber; 
+  const shopifyOrderId = update.orderNumber;
   const trackingNumber = update.trackingNumber;
   const carrier = update.carrier || "Other";
 
   try {
-    
-    const shopifyResponse = await fetch(`https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/orders/${shopifyOrderId}/fulfillments.json`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": SHOPIFY_TOKEN
-      },
-      body: JSON.stringify({
-        fulfillment: {
-          location_id: SHOPIFY_LOCATION_ID,
-          tracking_number: trackingNumber,
-          tracking_company: carrier,
-          notify_customer: true
-        }
-      })
-    });
+    const shopifyResponse = await fetch(
+      `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/orders/${shopifyOrderId}/fulfillments.json`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+        },
+        body: JSON.stringify({
+          fulfillment: {
+            location_id: SHOPIFY_LOCATION_ID,
+            tracking_number: trackingNumber,
+            tracking_company: carrier,
+            notify_customer: true,
+          },
+        }),
+      }
+    );
 
     const shopifyData = await shopifyResponse.json();
     console.log("✅ Updated Shopify order:", shopifyData);
 
     res.sendStatus(200);
   } catch (err) {
-    console.error("❌ Error updating Shopify:", err);
+    console.error("❌ Error updating Shopify:", err.message);
     res.sendStatus(500);
   }
 });
 
-
+// Root
 app.get("/", (req, res) => {
-  res.send("✅ Shopify ↔ FinerWorks middleware is running.");
+  res.send("✅ Shopify ↔ FinerWorks middleware is running securely.");
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () =>
+  console.log(`🚀 Middleware server running on port ${PORT}`)
+);
