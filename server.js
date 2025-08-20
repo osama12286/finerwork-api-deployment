@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
@@ -7,18 +8,28 @@ dotenv.config();
 const app = express();
 app.use(express.json({ type: "application/json" }));
 
+/**
+ * -------------------------------
+ * CONFIG
+ * -------------------------------
+ */
 // Shopify config
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE; // emeryart.myshopify.com
 const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN;
 const SHOPIFY_API_VERSION = "2025-01";
 const SHOPIFY_LOCATION_ID = process.env.SHOPIFY_LOCATION_ID;
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 
 // FinerWorks config
-const FINERWORKS_API_BASE = process.env.FINERWORKS_API_BASE;
+const FINERWORKS_API_BASE = process.env.FINERWORKS_API_BASE; // https://api.finerworks.com/v3
 const FINERWORKS_KEY = process.env.FINERWORKS_KEY;
+const FINERWORKS_WEB_KEY = process.env.FINERWORKS_WEB_KEY;
 
-// ✅ Verify Shopify Webhook
+/**
+ * -------------------------------
+ * VERIFY SHOPIFY WEBHOOK
+ * -------------------------------
+ */
 function verifyShopifyWebhook(req) {
   const hmacHeader = req.get("X-Shopify-Hmac-Sha256");
   const body = JSON.stringify(req.body);
@@ -31,10 +42,37 @@ function verifyShopifyWebhook(req) {
 
 /**
  * -------------------------------
- * PRODUCT SYNC
+ * HELPER → Get product details from FinerWorks
  * -------------------------------
- * Pull products from FinerWorks API
- * Push them into Shopify (create/update)
+ */
+async function getFinerWorksProductDetails(skus) {
+  const response = await fetch(`${FINERWORKS_API_BASE}/get_product_details`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "web_api_key": FINERWORKS_WEB_KEY, // 👈 web key
+      "app_key": FINERWORKS_KEY,         // 👈 app key
+    },
+    body: JSON.stringify(
+      skus.map((sku) => ({
+        product_order_po: null,
+        product_qty: 1,
+        product_sku: sku,
+      }))
+    ),
+  });
+
+  if (!response.ok) {
+    throw new Error(`FinerWorks error: ${response.statusText}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * -------------------------------
+ * PRODUCT SYNC (FinerWorks → Shopify)
+ * -------------------------------
  */
 app.get("/sync-products", async (req, res) => {
   try {
@@ -99,6 +137,12 @@ app.post("/shopify-order-created", async (req, res) => {
   console.log("📦 New order from Shopify:", order.id);
 
   try {
+    // 🔹 Fetch product details from FinerWorks for order SKUs
+    const skus = order.line_items.map((item) => item.sku);
+    const productDetails = await getFinerWorksProductDetails(skus);
+    console.log("ℹ️ Product details from FinerWorks:", productDetails);
+
+    // 🔹 Send order to FinerWorks
     const fwResponse = await fetch(`${FINERWORKS_API_BASE}/orders`, {
       method: "POST",
       headers: {
@@ -168,7 +212,11 @@ app.post("/finerworks-update", async (req, res) => {
   }
 });
 
-// Root
+/**
+ * -------------------------------
+ * ROOT
+ * -------------------------------
+ */
 app.get("/", (req, res) => {
   res.send("✅ Shopify ↔ FinerWorks middleware is running securely.");
 });
