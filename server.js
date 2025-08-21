@@ -1,6 +1,6 @@
 // server.js
 import express from "express";
-import fetch from "node-fetch";
+import axios from "axios";
 import dotenv from "dotenv";
 import crypto from "crypto";
 
@@ -14,7 +14,7 @@ app.use(express.json({ type: "application/json" }));
  * -------------------------------
  */
 // Shopify config
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE; // emeryart.myshopify.com
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE; // e.g. emeryart.myshopify.com
 const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN;
 const SHOPIFY_API_VERSION = "2025-01";
 const SHOPIFY_LOCATION_ID = process.env.SHOPIFY_LOCATION_ID;
@@ -46,27 +46,22 @@ function verifyShopifyWebhook(req) {
  * -------------------------------
  */
 async function getFinerWorksProductDetails(skus) {
-  const response = await fetch(`${FINERWORKS_API_BASE}/get_product_details`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "web_api_key": FINERWORKS_WEB_KEY, // 👈 web key
-      "app_key": FINERWORKS_KEY,         // 👈 app key
-    },
-    body: JSON.stringify(
-      skus.map((sku) => ({
-        product_order_po: null,
-        product_qty: 1,
-        product_sku: sku,
-      }))
-    ),
-  });
-
-  if (!response.ok) {
-    throw new Error(`FinerWorks error: ${response.statusText}`);
-  }
-
-  return response.json();
+  const response = await axios.post(
+    `${FINERWORKS_API_BASE}/get_product_details`,
+    skus.map((sku) => ({
+      product_order_po: null,
+      product_qty: 1,
+      product_sku: sku,
+    })),
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "web_api_key": FINERWORKS_WEB_KEY,
+        "app_key": FINERWORKS_KEY,
+      },
+    }
+  );
+  return response.data;
 }
 
 /**
@@ -77,10 +72,10 @@ async function getFinerWorksProductDetails(skus) {
 app.get("/sync-products", async (req, res) => {
   try {
     // 1. Get products from FinerWorks
-    const fwRes = await fetch(`${FINERWORKS_API_BASE}/products`, {
+    const fwRes = await axios.get(`${FINERWORKS_API_BASE}/products`, {
       headers: { Authorization: `Bearer ${FINERWORKS_KEY}` },
     });
-    const fwProducts = await fwRes.json();
+    const fwProducts = fwRes.data;
 
     // 2. Loop through products and push to Shopify
     for (const fwProduct of fwProducts) {
@@ -99,20 +94,18 @@ app.get("/sync-products", async (req, res) => {
         },
       };
 
-      const shopifyRes = await fetch(
+      const shopifyRes = await axios.post(
         `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/products.json`,
+        shopifyProduct,
         {
-          method: "POST",
           headers: {
             "Content-Type": "application/json",
             "X-Shopify-Access-Token": SHOPIFY_TOKEN,
           },
-          body: JSON.stringify(shopifyProduct),
         }
       );
 
-      const shopifyData = await shopifyRes.json();
-      console.log(`✅ Synced product ${fwProduct.name}`, shopifyData);
+      console.log(`✅ Synced product ${fwProduct.name}`, shopifyRes.data);
     }
 
     res.json({ message: "✅ Products synced from FinerWorks → Shopify" });
@@ -143,24 +136,25 @@ app.post("/shopify-order-created", async (req, res) => {
     console.log("ℹ️ Product details from FinerWorks:", productDetails);
 
     // 🔹 Send order to FinerWorks
-    const fwResponse = await fetch(`${FINERWORKS_API_BASE}/orders`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${FINERWORKS_KEY}`,
-      },
-      body: JSON.stringify({
+    const fwResponse = await axios.post(
+      `${FINERWORKS_API_BASE}/orders`,
+      {
         orderNumber: order.id,
         shippingAddress: order.shipping_address,
         items: order.line_items.map((item) => ({
           sku: item.sku,
           quantity: item.quantity,
         })),
-      }),
-    });
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${FINERWORKS_KEY}`,
+        },
+      }
+    );
 
-    const fwData = await fwResponse.json();
-    console.log("✅ Sent to FinerWorks:", fwData);
+    console.log("✅ Sent to FinerWorks:", fwResponse.data);
 
     res.sendStatus(200);
   } catch (err) {
@@ -183,27 +177,25 @@ app.post("/finerworks-update", async (req, res) => {
   const carrier = update.carrier || "Other";
 
   try {
-    const shopifyResponse = await fetch(
+    const shopifyResponse = await axios.post(
       `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/orders/${shopifyOrderId}/fulfillments.json`,
       {
-        method: "POST",
+        fulfillment: {
+          location_id: SHOPIFY_LOCATION_ID,
+          tracking_number: trackingNumber,
+          tracking_company: carrier,
+          notify_customer: true,
+        },
+      },
+      {
         headers: {
           "Content-Type": "application/json",
           "X-Shopify-Access-Token": SHOPIFY_TOKEN,
         },
-        body: JSON.stringify({
-          fulfillment: {
-            location_id: SHOPIFY_LOCATION_ID,
-            tracking_number: trackingNumber,
-            tracking_company: carrier,
-            notify_customer: true,
-          },
-        }),
       }
     );
 
-    const shopifyData = await shopifyResponse.json();
-    console.log("✅ Updated Shopify order:", shopifyData);
+    console.log("✅ Updated Shopify order:", shopifyResponse.data);
 
     res.sendStatus(200);
   } catch (err) {
@@ -214,11 +206,26 @@ app.post("/finerworks-update", async (req, res) => {
 
 /**
  * -------------------------------
+ * TEST FINERWORKS ENDPOINT
+ * -------------------------------
+ */
+app.get("/test-finerworks", async (req, res) => {
+  try {
+    const result = await getFinerWorksProductDetails(["AP98520P583742"]);
+    res.json(result);
+  } catch (err) {
+    console.error("❌ Test error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * -------------------------------
  * ROOT
  * -------------------------------
  */
 app.get("/", (req, res) => {
-  res.send("✅ Shopify ↔ FinerWorks middleware is running securely.");
+  res.send("✅ Shopify ↔ FinerWorks middleware is running securely (Axios version).");
 });
 
 // Start server
